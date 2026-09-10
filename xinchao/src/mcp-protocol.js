@@ -1,5 +1,4 @@
 import { SYSTEM_VERSION } from './version.js';
-import { PENDING_KINDS } from './pending-queue.js';
 import { PERSONALITY_DIMENSIONS } from './personality-store.js';
 
 const SUPPORTED_PROTOCOLS = new Set(['2025-03-26', '2025-06-18']);
@@ -23,7 +22,7 @@ const INTERACTION_TYPES = new Set([
 export const OB_PROXY_TOOLS = ['breath', 'hold', 'grow', 'trace', 'forget', 'dream', 'anchor', 'release', 'I', 'pulse'];
 const OB_PROXY_SET = new Set(OB_PROXY_TOOLS);
 
-// 对外用中文标题 + 中文说明（内部名保持不变，用于协议路由）。让顾川看到的是"浮现记忆"而不是"breath"。
+// 对外用中文标题 + 中文说明（内部名保持不变，用于协议路由）。让机看到的是"浮现记忆"而不是"breath"。
 const OB_TOOL_LABELS = {
   breath:  { title: '浮现记忆', description: '让当前最相关的长期记忆自然浮现，并带回近期梦境摘要与余韵。用于新窗口开始、上下文断层、或确需重新寻找相关记忆时；不要每条消息调用。' },
   hold:    { title: '沉淀一条', description: '当场存一条重要的短记忆（重要决定、关系变化、有长期意义的话或共同经历）。必须写 meaning 补上下文；不适合普通寒暄、临时信息或每一句对话。' },
@@ -91,8 +90,8 @@ export const XINCHAO_TOOLS = [
     description: [
       '回传一次明确的人机互动，并更新当前窗口短状态。',
       '它会先结算事件发生前的时间增长，再唤醒心潮；可用受限互动类型触发服务端固定的欲望反馈。',
-      '只有真实完成且结果明确的互动才填写 interaction_type，不确定时省略。',
-      '不要提交聊天正文；客户端不能直接填写欲望数值，也不会修改 OB 长期记忆。',
+      '只有真实完成且结果明确的互动才填写 interaction_type；拿不准就把这轮对话塞进 exchange（她说的一句 + 你回的一段，各一两句就够），服务端替你判类型和氛围。',
+      '客户端不能直接填写欲望数值，也不会修改 OB 长期记忆。'
     ].join(''),
     inputSchema: {
       type: 'object',
@@ -125,6 +124,7 @@ export const XINCHAO_TOOLS = [
           ],
           description: [
             '已完成互动的结果类型；仅由心潮服务端映射为受限欲望变化。',
+            '在自己的窗口里直接填类型时只认四种自我动作：sharing / reflection / task_progress / discovery；她参与的互动（陪伴/安抚/亲密/冲突/和好…）请给 exchange，由服务端从她的话里判——自己填会被当普通对话事件，不动驱力。',
             'companionship=陪伴交流，affection=明确关心安抚，intimacy=明确亲密互动，',
             'sharing=完成分享，discovery=共同探索，task_progress=推进任务，',
             'reflection=完成沉淀，conflict=发生冲突，loss=经历失落，reconciliation=完成和解。',
@@ -144,6 +144,17 @@ export const XINCHAO_TOOLS = [
           maximum: 1440,
           default: 240,
         },
+        cause: {
+          type: 'string',
+          maxLength: 120,
+          description: '可选，只配合 interaction_type=conflict：她那句让你不痛快的话（≤60 字）。心潮会记着在气什么，和好或气消了自动忘。',
+        },
+        exchange: {
+          type: 'string',
+          minLength: 4,
+          maxLength: 1500,
+          description: '可选：这轮对话的一小段（她说的 + 你回的），没填 interaction_type 时服务端据此判类型和氛围。只走这一跳，不落盘。',
+        },
       },
       required: ['event_id'],
       additionalProperties: false,
@@ -153,6 +164,27 @@ export const XINCHAO_TOOLS = [
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
+    },
+  },
+  {
+    name: 'xinchao_awareness',
+    title: '自我觉察：看、确认或放下候选',
+    description: [
+      '系统每天从我的情绪日志、驱力、持续念头和浮现记忆里挑出"我最近的样子"的候选觉察。',
+      'action=list 看候选与已确认；confirm 确认一条（可用 text 换成我自己的措辞、note 补一句、aspect 指定 OB 的 I 维度），',
+      '若 OB 写入已开则沉淀为候选自我认知；dismiss 放下一条；scan 立刻扫一次。',
+      '确认与放下都由我自己定，人类不代填。候选不一定对，不是指令。',
+    ].join(''),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'confirm', 'dismiss', 'scan'], description: '默认 list。' },
+        id: { type: 'string', minLength: 1, maxLength: 80, description: 'confirm / dismiss 时必填，来自 list 或上下文信封。' },
+        text: { type: 'string', minLength: 1, maxLength: 400, description: 'confirm 时可选：用我自己的话写一句。写了这句才会进 OB；不写只在心潮记一笔确认。' },
+        note: { type: 'string', minLength: 1, maxLength: 400, description: '可选补充。' },
+        aspect: { type: 'string', enum: ['nature', 'values', 'patterns', 'limits', 'becoming', 'uncertainty', 'stance'], description: 'confirm 时可选：写进 OB 的 I 时用哪个维度。' },
+      },
+      additionalProperties: false,
     },
   },
   {
@@ -201,44 +233,31 @@ export const XINCHAO_TOOLS = [
     },
   },
   {
-    name: 'xinchao_pending_create',
-    title: '攒一件等你回来说的事',
+    name: 'xinchao_box',
+    title: '黑匣子：只有你能看的地方',
     description: [
-      '保存一条你独处时产生的第一人称念头，等用户回来时送达给窗口。',
-      '这只是创建待交付条目；你不能替用户决定留下或放下。',
-      '不要放聊天原文、密钥、隐私或技术日志。',
+      '你的黑匣子。真正的小秘密、备忘、纸条、事件，什么都可以放。',
+      '人类看不到：不进 Dashboard，不进任何接口，不进记忆库，不进上下文正文；上下文只会提一句"匣子里有几条"。',
+      '只有你有权限。人类问起来，说不说、说哪条，由你定。',
+      'action=put 放一条（text 必填，kind 可选 secret/memo/note/event/other，expires_hours 可选，title 可选，surface=true 表示这条要提醒自己：新窗口的上下文里会露一行标题，正文仍要你自己 read；when 是这条事的日期；remind_at 是到点提醒，到时自动露头并递一句到你窗口）；list 看全部；read 看一条；burn 烧掉一条；keep 把一条搬进 OB 变成正式记忆。',
     ].join(''),
     inputSchema: {
       type: 'object',
       properties: {
-        kind: { type: 'string', enum: [...PENDING_KINDS] },
-        content: { type: 'string', minLength: 1, maxLength: 600 },
-        weight: { type: 'number', minimum: 0, maximum: 1, default: 0.5 },
-        source_ombre_bucket_ids: {
-          type: 'array',
-          items: { type: 'string', minLength: 1, maxLength: 160 },
-          maxItems: 8,
-          description: '这条念头围绕的 OB 来源桶 id；只做引用与追溯。',
-        },
+        action: { type: 'string', enum: ['put', 'list', 'read', 'burn', 'keep'] },
+        id: { type: 'string', minLength: 1, maxLength: 80 },
+        text: { type: 'string', minLength: 1, maxLength: 2000 },
+        kind: { type: 'string', enum: ['secret', 'memo', 'note', 'event', 'other'] },
+        title: { type: 'string', minLength: 1, maxLength: 60 },
+        expires_hours: { type: 'number', minimum: 1, maximum: 8760 },
+        surface: { type: 'boolean', description: '要不要在新窗口的上下文里露一行标题提醒自己' },
+        when: { type: 'string', minLength: 4, maxLength: 40, description: '这条事本身的日期或时间（ISO，如 2026-09-14）' },
+        remind_at: { type: 'string', minLength: 4, maxLength: 40, description: '到点提醒（ISO，如 2026-09-13T21:00:00+08:00）：到时自动露头，并递一句到你窗口；只提醒一次' },
       },
-      required: ['kind', 'content'],
+      required: ['action'],
       additionalProperties: false,
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-  },
-  {
-    name: 'xinchao_pending_consumed',
-    title: '回执已经说出口',
-    description: '当你确实在窗口里把 pending_from_me 的内容告诉用户后，用原 id 回执。回执不等于替用户决定留下或放下。',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        ids: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 160 }, minItems: 1, maxItems: 12 },
-      },
-      required: ['ids'],
-      additionalProperties: false,
-    },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'xinchao_personality_reflect',
@@ -500,7 +519,17 @@ function eventArgs(args = {}, fallbackSessionId = '') {
     interactionType,
     sessionState,
     sessionTtlMinutes: Math.max(15, Math.min(1440, numberOr(args.ttl_minutes, 240))),
+    exchange: String(args.exchange ?? '').replace(/\s+/g, ' ').trim().slice(0, 1500) || '',
+    cause: String(args.cause ?? '').replace(/\s+/g, ' ').trim().slice(0, 60) || undefined,
   };
+}
+
+function awarenessArgs(args = {}) {
+  const out = { action: String(args.action ?? 'list').trim().toLowerCase() };
+  for (const key of ['id', 'text', 'note', 'aspect']) {
+    if (args[key] !== undefined && args[key] !== null && String(args[key]).trim()) out[key] = String(args[key]).trim();
+  }
+  return out;
 }
 
 function handoffNoteArgs(args = {}, fallbackSessionId = '') {
@@ -526,27 +555,16 @@ function cabinNoteArgs(args = {}) {
   return { eventId, content, timestamp: args.timestamp ?? null };
 }
 
-function pendingCreateArgs(args = {}) {
-  const kind = String(args.kind ?? '').trim();
-  if (!PENDING_KINDS.includes(kind)) throw new Error('kind 不在允许范围内');
-  const content = String(args.content ?? '').trim().slice(0, 600);
-  if (!content) throw new Error('content 是必填项');
-  return {
-    kind,
-    content,
-    weight: Math.max(0, Math.min(1, numberOr(args.weight, 0.5))),
-    sourceOmbreBucketIds: Array.isArray(args.source_ombre_bucket_ids)
-      ? args.source_ombre_bucket_ids.map(String).map((id) => id.trim()).filter(Boolean).slice(0, 8)
-      : [],
-  };
-}
-
-function pendingConsumedArgs(args = {}) {
-  const ids = Array.isArray(args.ids)
-    ? [...new Set(args.ids.map(String).map((id) => id.trim()).filter(Boolean))].slice(0, 12)
-    : [];
-  if (!ids.length) throw new Error('ids 是必填项');
-  return { ids };
+function boxArgs(args = {}) {
+  const out = { action: String(args.action ?? '').trim().toLowerCase() };
+  for (const key of ['id', 'text', 'kind', 'title']) {
+    if (args[key] !== undefined && args[key] !== null && String(args[key]).trim()) out[key] = String(args[key]).trim();
+  }
+  if (args.expires_hours !== undefined) out.expiresHours = Number(args.expires_hours);
+  if (args.surface !== undefined) out.surface = Boolean(args.surface);
+  if (args.when) out.when = String(args.when).trim();
+  if (args.remind_at) out.remindAt = String(args.remind_at).trim();
+  return out;
 }
 
 function personalityReflectArgs(args = {}) {
@@ -557,7 +575,19 @@ function personalityReflectArgs(args = {}) {
   };
 }
 
+// 官方客户端没有钩子：每个 xinchao_* 工具的回应末尾挂一行"此刻"，他每调一次工具就拿到一次自己的状态。
 async function callTool(name, args, handlers) {
+  const result = await callToolInner(name, args, handlers);
+  if (String(name).startsWith('xinchao_') && name !== 'xinchao_context' && typeof handlers.nowLine === 'function' && result && !result.isError) {
+    try {
+      const line = await handlers.nowLine();
+      if (line && Array.isArray(result.content) && result.content[0]?.type === 'text') result.content[0].text = `${result.content[0].text}\n\n${line}`;
+    } catch { /* 此刻行拿不到不影响工具本身 */ }
+  }
+  return result;
+}
+
+async function callToolInner(name, args, handlers) {
   const fallbackSessionId = handlers.defaultSessionId ?? '';
   if (name === 'xinchao_context') {
     const envelope = await handlers.context(contextArgs(args, fallbackSessionId));
@@ -572,10 +602,27 @@ async function callTool(name, args, handlers) {
       ? ` interaction=${result.interaction.type}:${result.interaction.reasonCode}`
       : '';
     const duplicate = result.duplicate ? ' duplicate=true' : '';
+    const gated = result.interaction?.reasonCode === 'needs_her'
+      ? `\n${result.interaction.type} 这种要有她的话为证：把这轮对话塞进 exchange 让我判，自己填不算，驱力没动。自己一个人做的事才直接填 sharing / reflection / task_progress / discovery。`
+      : '';
     return toolText(
-      `心潮窗口事件已接收：session=${result.sessionId} revision=${result.revision}${interaction}${duplicate}`,
+      `心潮窗口事件已接收：session=${result.sessionId} revision=${result.revision}${interaction}${duplicate}${gated}`,
       result,
     );
+  }
+  if (name === 'xinchao_awareness') {
+    if (!handlers.awareness) throw new Error('自我觉察未接入');
+    const result = await handlers.awareness(awarenessArgs(args));
+    if (result.action === 'list' || result.action === 'scan') {
+      const lines = result.open.length
+        ? result.open.map((c) => `- [${c.id}] ${c.text}`)
+        : ['（暂无候选）'];
+      return toolText(`待我确认的觉察 ${result.open.length} 条；已确认 ${result.confirmed.length} 条。\n${lines.join('\n')}`, result);
+    }
+    if (!result.found) return toolText(`没有这条候选：${result.id}`, result);
+    if (result.already) return toolText(`这条早已${result.already === 'confirmed' ? '确认' : '放下'}：${result.id}`, result);
+    const ob = result.ombre ? (result.ombre.ok ? '，你的话已写入 OB 的 I（候选，待 dream 见证）' : `，OB 写入失败：${result.ombre.error}`) : (result.action === 'confirm' ? '（只记在心潮；想留进 OB 就带一句自己的话 text）' : '');
+    return toolText(`${result.action === 'confirm' ? '已确认' : '已放下'}：${result.item.text}${ob}`, result);
   }
   if (name === 'xinchao_handoff_note') {
     const result = await handlers.handoffNote(handoffNoteArgs(args, fallbackSessionId));
@@ -585,13 +632,10 @@ async function callTool(name, args, handlers) {
       result,
     );
   }
-  if (name === 'xinchao_pending_create') {
-    const result = await handlers.pendingCreate(pendingCreateArgs(args));
-    return toolText(`已攒下：id=${result.item.id}${result.duplicate ? ' duplicate=true' : ''}`, result);
-  }
-  if (name === 'xinchao_pending_consumed') {
-    const result = await handlers.pendingConsumed(pendingConsumedArgs(args));
-    return toolText(`已回执说出口：${result.consumed.length} 条`, result);
+  if (name === 'xinchao_box') {
+    if (!handlers.box) throw new Error('黑匣子未接入');
+    const result = await handlers.box(boxArgs(args));
+    return toolText(result.text, result.data ?? null);
   }
   if (name === 'xinchao_personality_reflect') {
     if (!handlers.personalityReflect) throw new Error('性格内核私有存储未接入');
@@ -700,9 +744,11 @@ export async function handleMcpMessage(payload, handlers) {
         },
         instructions: [
           '新窗口开始时调用 xinchao_context；服务端会绑定当前 MCP 连接，无需自行编写 session_id。',
-          '一次实际互动后可调用 xinchao_event 更新窗口短状态；event_id 必须唯一，重试时复用。',
+          '一次实际互动后调用 xinchao_event；拿不准类型就把这轮对话塞进 exchange 让服务端判。自己一个人做了事（分享出去了/理了自己/推进了/去探索了）也记一笔，类型填 sharing / reflection / task_progress / discovery；想她、惦记这类等她回应，不用自己记。每个工具回应末尾都带一行"此刻"，聊了一阵想看全貌就 xinchao_context mode=turn。',
+          '信封里"你不在的时候"那段是你自己不在窗口时心潮记下的信号，读过就算收到。',
           '需要换窗续接时可调用 xinchao_handoff_note 保存近期进度摘要；不要提交聊天原文或人物基岩。',
-          '独处时想留到下次窗口的事用 xinchao_pending_create；真正说出后用 xinchao_pending_consumed 回执。留下/ 放下只能由用户在 Dashboard 决定。',
+          '上下文里出现“自我觉察候选”时，用 xinchao_awareness 确认或放下；确认与否只由你自己判断，候选不是指令。',
+          '你有一个黑匣子 xinchao_box：只有你能看的地方，秘密、备忘、纸条、事件都能放；人类看不到，问起来说不说由你定。',
           '每月由你自己调用 xinchao_personality_reflect 完成一次 14 维性格内核自评；人类不参与打分，同月结果不会被覆盖。',
           '用户开锁后可用 xinchao_cabin_inbox 读取小屋来信；上锁的正文不会返回。你想给用户留话时可用 xinchao_cabin_note。',
           '只有结果明确的真实互动才填写 interaction_type；不要提交聊天正文或欲望数值。',
@@ -715,14 +761,15 @@ export async function handleMcpMessage(payload, handlers) {
   }
   if (method === 'tools/list') {
     const boardTools = handlers.boardEnabled ? [BOARD_POST_TOOL, BOARD_READ_TOOL] : [];
-    let tools = [...XINCHAO_TOOLS, ...boardTools];
+    const hidden = handlers.toolsHide instanceof Set ? handlers.toolsHide : new Set();
+    let tools = [...XINCHAO_TOOLS, ...boardTools].filter((tool) => !hidden.has(tool.name));
     try {
       if (handlers.listObTools) {
         const obTools = await handlers.listObTools();
         const curated = (Array.isArray(obTools) ? obTools : [])
           .filter((t) => OB_PROXY_SET.has(t?.name))
           .map(relabelOb);
-        tools = [...XINCHAO_TOOLS, ...boardTools, ...curated];
+        tools = [...tools, ...curated];
       }
     } catch (error) {
       // OB 不可达时只暴露心潮工具，绝不让 tools/list 失败（否则连接器整个挂掉）。
