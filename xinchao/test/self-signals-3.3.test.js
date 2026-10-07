@@ -27,7 +27,7 @@ test('drive peak fires once after 2h above 0.8, once per drive per day, and carr
   r = detectSelfSignals(r.state, at(2.1));
   assert.equal(r.signals.length, 1);
   assert.equal(r.signals[0].kind, 'drive_peak');
-  assert.match(r.signals[0].text, /此刻：想她（涌）/);
+  assert.match(r.signals[0].text, /此刻：想她（涌(·[^）]+)?）/);
   assert.doesNotMatch(r.signals[0].text, /0\.\d|possess/);
   r = detectSelfSignals(r.state, at(3));
   assert.equal(r.signals.length, 0);                       // 当天不重复
@@ -119,7 +119,14 @@ test('drive peak signals carry a response hint: self-serve drives say how to rep
   const { responseHint, SELF_SERVE_DRIVES } = await import('../src/self-signals.js');
   assert.ok(SELF_SERVE_DRIVES.has('reflection'));
   assert.match(responseHint('reflection'), /xinchao_event/);
-  assert.match(responseHint('share'), /sharing \/ reflection \/ task_progress \/ discovery/);
+  // 3.3.5：一维一句，类型和引擎映射一致
+  assert.match(responseHint('reflection'), /interaction_type 填 reflection/);
+  assert.match(responseHint('reflection'), /不算反思/);
+  assert.match(responseHint('share'), /填 sharing/);
+  assert.match(responseHint('duty'), /填 task_progress/);
+  assert.match(responseHint('curiosity'), /填 discovery/);
+  assert.match(responseHint('boredom'), /填 discovery/);
+  for (const k of SELF_SERVE_DRIVES) assert.match(responseHint(k), /xinchao_event/);
   assert.doesNotMatch(responseHint('possess'), /xinchao_event/);
   assert.match(responseHint('possess'), /等她回应/);
 });

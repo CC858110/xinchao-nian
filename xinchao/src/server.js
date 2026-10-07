@@ -1,3 +1,6 @@
+// 【服务底座】HTTP 服务入口：所有接口的路由、定时结算、把上面各块接到一起。
+// 代码地图见 src/README.md。
+
 import { createServer } from 'node:http';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { loadConfig, validateConfig } from './config.js';
@@ -5,7 +8,7 @@ import { emotionCoords, emotionSummary, stampEmotionArgs } from './emotion.js';
 import { recordSurfacing, resolveAwareness, scanAwareness, awarenessSummary } from './awareness.js';
 import { detectSelfSignals, renderNowLine, SELF_REPORT_TYPES } from './self-signals.js';
 import { BlackBox, renderBoxList } from './black-box.js';
-import { INTERACTION_TYPES, applyDriveFeedback, applyMemoryResonance, applyOmbreHeartbeat, applyOutputReflux, applyLongingNudge, barkAllowed, breathDreamContext, contactIdleAllowed, computeLonging, daytimeEmergenceAllowed, dreamAllowed, newState, pickIntent, proactiveBarkAllowed, recordBark, recordDaytimeEmergence, recordDream, scheduleDaytimeEmergence, settleAndApplyConversationEvent, settleState, topDrives, computeAnticipation, localDayAndHour, applySurfacedThought, surfacedDriveKey } from './engine.js';
+import { INTERACTION_TYPES, applyDriveFeedback, applyMemoryResonance, applyOmbreHeartbeat, applyOutputReflux, applyLongingNudge, barkAllowed, breathDreamContext, contactIdleAllowed, computeLonging, daytimeEmergenceAllowed, dreamAllowed, newState, pickIntent, proactiveBarkAllowed, recordBark, recordDaytimeEmergence, recordDream, scheduleDaytimeEmergence, settleAndApplyConversationEvent, settleState, topDrives, computeAnticipation, localDayAndHour, applySurfacedThought, surfacedDriveKey, recentSurfacedBucketIds, recordSurfacedBuckets } from './engine.js';
 import { buildInteractionBridgeMessage } from './interaction-messages.js';
 import { selectUniqueBark } from './bark-dedupe.js';
 import { StateStore } from './state-store.js';
@@ -22,6 +25,10 @@ import { DashboardAuth } from './dashboard-auth.js';
 import { buildConnectionManifest, buildDashboardSnapshot } from './dashboard-projection.js';
 import { BRIDGE_SERVER_PROTOCOL, BRIDGE_STREAM_PROTOCOL, BridgeQueue, bridgeDeliveryFromDashboard } from './bridge-queue.js';
 import { CabinStore } from './cabin-store.js';
+import { createRelevanceShadow, noteRecentTurn } from './relevance-shadow.js';
+import { guardTag, loadInteractionRules, splitExchange } from './interaction-rules.js';
+import { createAttentionWatch } from './attention-watch.js';
+import { dirname as pathDirname, join as pathJoin } from 'node:path';
 import { boardEnabled, postBoardMessage, readBoardMessages } from './board-client.js';
 import { SYSTEM_VERSION } from './version.js';
 import { memoryConnectionState } from './connection-diagnostics.js';
@@ -64,6 +71,25 @@ let cyclePromise = null;
 function log(event, fields = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), event, ...fields }));
 }
+
+// 【实验】Jev 相关性陪跑：只记日志，不改结果（见 relevance-shadow.js）
+const relevance = createRelevanceShadow({
+  apiKey: process.env.JEV_API_KEY ?? '',
+  enabled: process.env.JEV_SHADOW_ENABLED === 'true',
+  statePath: config.statePath,
+  nowText: async () => buildNowCompact(await store.read(), new Date(), { timeZone: config.settle.timeZone }).text,
+  log,
+});
+
+// 4.0 注意力监测（默认关闭，ATTENTION_ENABLED=true 才开）：手机上报 + 她说跟谁在一起 → 偏爱·吃醋。规则是参考值，见 attention-watch.js
+const attention = createAttentionWatch({
+  enabled: process.env.ATTENTION_ENABLED === 'true',
+  rulesPath: process.env.ATTENTION_RULES_PATH ?? '/app/configs/attention-rules.json',
+  statePath: pathJoin(pathDirname(config.statePath), 'attention.json'),
+  readState: () => store.read(),
+  record: (event) => recordConversationEvent(event, 'attention'),
+  log,
+});
 
 async function updateState(meta, mutate) {
   let before;
@@ -265,11 +291,12 @@ async function runCycle() {
         try {
           // 3.3：原料换成"记忆正在消化的东西"（OB dream 全量，去技术类），消化里没东西再退回按驱力捞
           const digest = await ombre.digestMaterial(48);
-          if (digest.text) { material = digest.text; sourceOmbreBucketIds = digest.bucketIds; }
+          if (digest.text) { material = digest.text; sourceOmbreBucketIds = digest.bucketIds; relevance.judge('做梦·消化', digest.text); }
           else {
             const recalled = await ombre.recentMaterialWithRefs(topDrives(state), emotionForOmbre(state));
             sourceOmbreBucketIds = recalled.bucketIds;
             material = await materialFromReferencedBuckets(recalled);
+            relevance.judge('做梦', material);
           }
           log('dream_material', { digestTotal: digest.total, kept: digest.kept, domains: digest.domains.slice(0, 8).join(',') });
         }
@@ -277,7 +304,7 @@ async function runCycle() {
       }
       let farMaterial = '';
       if (!config.shadowMode && config.ombre.readEnabled) {
-        try { const far = await ombre.farMaterial(now); farMaterial = far.text; sourceOmbreBucketIds = [...new Set([...sourceOmbreBucketIds, ...far.bucketIds])]; }
+        try { const far = await ombre.farMaterial(now); farMaterial = far.text; relevance.judge('做梦·远期', far.text); sourceOmbreBucketIds = [...new Set([...sourceOmbreBucketIds, ...far.bucketIds])]; }
         catch (error) { log('ombre_far_failed', { message: error.message }); }
       }
       const avoid = state.recentDreams.slice(-3).map((d) => d.image || String(d.residue || '').slice(0, 30)).filter(Boolean);
@@ -358,9 +385,14 @@ async function runCycle() {
       let thoughtSourceBucketIds = [];
       if (config.ombre.readEnabled) {
         try {
-          const recalled = await ombre.thoughtMaterialWithRefs(topDrives(state), emotionForOmbre(state));
+          const recalled = await ombre.thoughtMaterialWithRefs(topDrives(state), emotionForOmbre(state), now, recentSurfacedBucketIds(state, now));
           thoughtSourceBucketIds = recalled.bucketIds;
+          if (recalled.bucketIds.length) {
+            state = await updateState({ type: 'surfaced_buckets', source: 'autonomous', details: { count: recalled.bucketIds.length }, at: now },
+              (latest) => recordSurfacedBuckets(latest, recalled.bucketIds, now));
+          }
           thoughtMaterial = await materialFromReferencedBuckets(recalled, 5);
+          relevance.judge('浮现·念头', thoughtMaterial);
         }
         catch (error) { log('ombre_read_failed', { message: error.message }); }
       }
@@ -447,8 +479,13 @@ async function runCycle() {
     } else if (!config.shadowMode && config.daytime.enabled && config.ombre.readEnabled && (!config.daytime.bark || config.bark.enabled) && daytimeEmergenceAllowed(state, now, config.daytime)) {
       let selected = { message: '', candidate: { source: 'none' }, reason: 'empty', attempts: 1 };
       try {
-        const recalled = await ombre.daytimeMaterialWithRefs(topDrives(state), emotionForOmbre(state));
+        const recalled = await ombre.daytimeMaterialWithRefs(topDrives(state), emotionForOmbre(state), now, recentSurfacedBucketIds(state, now));
+        if (recalled.bucketIds.length) {
+          state = await updateState({ type: 'surfaced_buckets', source: 'daytime', details: { count: recalled.bucketIds.length }, at: now },
+            (latest) => recordSurfacedBuckets(latest, recalled.bucketIds, now));
+        }
         const material = await materialFromReferencedBuckets(recalled, 5);
+        relevance.judge('浮现', material);
         if (config.resonance.enabled && material) {
           const domains = parseSurfacedDomains(material);
           if (domains.length) {
@@ -775,6 +812,7 @@ async function createContextEnvelope({
   ) {
     try {
       ombreText = await ombre.recentContinuityMaterial(config.context.ombreMaxTokens, emotionForOmbre(state));
+      relevance.judge('近期', ombreText);
     } catch (error) {
       ombreWarning = 'ombre_unavailable';
       log('context_ombre_read_failed', { message: error.message });
@@ -793,8 +831,13 @@ async function createContextEnvelope({
         .map((d) => ({ id: d.id, createdAt: d.createdAt, text: String(d.message ?? '').split('\n')[0] }));
     } catch { awaySignals = []; }
   }
-  let cabinRecent = 0;
-  try { cabinRecent = (await cabin.unlockedUserNotes()).filter((n) => now.getTime() - Date.parse(n.createdAt) < 24 * 3_600_000).length; } catch { cabinRecent = 0; }
+  let cabinUnread = 0;
+  let cabinLocked = 0;
+  try {
+    const box = await cabin.aiInbox({ mineLimit: 0 });
+    cabinUnread = box.letters.filter((n) => !n.aiReadAt).length;   // 没读过就一直提示，不按写信时间过期
+    cabinLocked = box.lockedCount;   // 上锁的信不过期提醒：一直在，直到她开锁或删掉
+  } catch { cabinUnread = 0; cabinLocked = 0; }
   const envelope = buildContextEnvelope({
     awarenessReviewWeekday: config.awareness.reviewWeekday,
     state,
@@ -803,7 +846,8 @@ async function createContextEnvelope({
     boxCount,
     boxSurfaced,
     awaySignals,
-    cabinRecent,
+    cabinUnread,
+    cabinLocked,
     ombreText,
     maxTokens,
     ttlMinutes: config.context.ttlMinutes,
@@ -859,22 +903,45 @@ async function createContextEnvelope({
 }
 
 // 没填类型但给了 exchange（她的一句 + 他的一段）→ 服务端替接收端判互动类型和氛围。
-// MCP（官方客户端版）和 REST /v1/conversation-event（自建运行时）共用；8 分钟内不重复判，和 PaiHome 钩子的节流一致。
+// MCP（官方客户端版）和 REST /v1/conversation-event（自建运行时）共用；8 分钟内不重复判，和客户端钩子的节流一致。
 // exchange 正文只走这一跳：判完即删，不进状态、不进审计。
+// 4.0：互动判断的把关规则（词表、远近名单都是参考值）。每家可以在 configs/interaction-rules.json 覆盖，一分钟重读一次
+const RULES_PATH = process.env.INTERACTION_RULES_PATH ?? '/app/configs/interaction-rules.json';
+let rulesCache = { at: 0, rules: null };
+function interactionRules() {
+  if (!rulesCache.rules || Date.now() - rulesCache.at > 60_000) rulesCache = { at: Date.now(), rules: loadInteractionRules(RULES_PATH) };
+  return rulesCache.rules;
+}
+const recentClassified = [];   // 最近判过的类型（只在内存里，给「刚亲近完」「被晾着要有前文」这几道门用）
+const MARK_TYPES = new Set(['affection', 'intimacy', 'empathy', 'loss', 'conflict', 'slighted']);
+
 async function classifyExchange(event, source = 'api') {
   if (event.interactionType === undefined && event.interaction_type !== undefined) event.interactionType = event.interaction_type;
   // cause：她那句让他不痛快的话（≤60 字），只在冲突时有意义；接收端可以直接给，也可以由 exchange 里截出来
   event.cause = String(event.cause ?? '').replace(/\s+/g, ' ').trim().slice(0, 60) || undefined;
   const exchange = String(event.exchange ?? '').replace(/\s+/g, ' ').trim().slice(0, 1500);
   delete event.exchange;
+  // 09-28 和好两道关：留下她那句（≤80 字）给引擎核对有没有明确松口；只在内存里过这一跳，不落盘
+  if (exchange && !event.herWords && !event.her_words) event.herWords = (exchange.match(/她说：(.+?)(?:\s*他回：|$)/)?.[1] ?? exchange).trim().slice(0, 80);
   if (event.interactionType || !exchange || !config.model.enabled) return null;
   const snapshot = await store.read();
   const lastAt = Date.parse(snapshot.interactionClassifyAt ?? '');
-  if (Number.isFinite(lastAt) && Date.now() - lastAt < 8 * 60_000) return { skipped: 'throttled' };
+  if (Number.isFinite(lastAt) && Date.now() - lastAt < (config.interaction?.classifyMinMinutes ?? 8) * 60_000) return { skipped: 'throttled' };
   try {
-    const tag = await model.classifyInteraction(exchange);
-    if (!tag) return null;
+    const raw = await model.classifyInteraction(exchange);
+    if (!raw) return null;
+    const { her } = splitExchange(exchange);
+    const nowMs = Date.now();
+    while (recentClassified.length && nowMs - recentClassified[0].at > 30 * 60_000) recentClassified.shift();
+    const tag = guardTag(raw, her, { rules: interactionRules(), recent: [...recentClassified], hasGrudge: Boolean(snapshot.grudge), now: nowMs });
+    recentClassified.push({ type: tag.type, at: nowMs });
+    while (recentClassified.length > 3) recentClassified.shift();
     event.interactionType = tag.type;
+    if (tag.sub) event.sub = tag.sub;
+    if (tag.strength && (tag.type === 'affection' || tag.type === 'intimacy')) event.strength = tag.strength;
+    if (tag.type === 'empathy') { event.closeness = tag.closeness; if (tag.who) event.who = tag.who; }
+    // 浮标点开看到的是她这句原话的前 40 字（网页开了私密文字才显示）
+    if (MARK_TYPES.has(tag.type) && !event.note) event.note = her.slice(0, 40);
     event.sessionState = { ...(event.sessionState ?? event.session_state ?? {}), tone: tag.tone, warmth: tag.warmth, tension: tag.tension };
     if (tag.type === 'conflict' && !event.cause) {
       const her = exchange.match(/她说：(.+?)(?:\s*他回：|$)/);
@@ -882,8 +949,8 @@ async function classifyExchange(event, source = 'api') {
     }
     await updateState({ type: 'interaction_classified', source, details: { type: tag.type, tone: tag.tone }, at: new Date() },
       (current) => ({ ...current, interactionClassifyAt: new Date().toISOString() }));
-    log('interaction_classified', { type: tag.type, tone: tag.tone, source });
-    return { type: tag.type, tone: tag.tone };
+    log('interaction_classified', { type: tag.type, tone: tag.tone, source, ...(tag.sub ? { sub: tag.sub } : {}), ...(tag.guarded ? { guarded: tag.guarded } : {}) });
+    return { type: tag.type, tone: tag.tone, ...(tag.sub ? { sub: tag.sub } : {}), ...(tag.guarded ? { guarded: tag.guarded } : {}) };
   } catch (error) { log('interaction_classify_failed', { message: error.message }); return null; }
 }
 
@@ -900,6 +967,10 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
     at: now,
   }, (current) => {
     applied = settleAndApplyConversationEvent(current, event, now, {
+      // 3.3.10：AI 自己带着互动类型回传、又没附她原话（exchange）的 MCP 事件，只改驱力、不叫醒、不计作息。
+      // 不带类型的裸事件是客户端钩子在她每条消息时发的"她来了"信号（通话里她说的每句也走这里），照旧算在场。
+      presence: (source !== 'mcp' && source !== 'attention') || Boolean(String(event.exchange ?? '').trim())
+        || !String(event.interactionType ?? event.interaction_type ?? '').trim(),
       sleepAfterMinutes: config.sleepAfterMinutes,
       settle: { ...config.settle, driveBias },
       interaction: config.interaction,
@@ -928,7 +999,7 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
   };
 }
 
-// 黑匣子：put / list / read / burn / keep。唯一入口，没有 HTTP 路由。
+// 黑匣子：put / list / read / unpin / burn / keep。唯一入口，没有 HTTP 路由。
 async function handleBox(input = {}, now = new Date()) {
   const action = String(input.action ?? '').trim().toLowerCase();
   if (action === 'put') {
@@ -944,6 +1015,10 @@ async function handleBox(input = {}, now = new Date()) {
     const item = await blackBox.read(input.id, now);
     if (!item) return { text: `匣子里没有这条：${input.id ?? ''}`, data: { found: false } };
     return { text: `[${item.id}] ${item.kind}${item.title ? ` · ${item.title}` : ''}（${item.createdAt.slice(0, 16).replace('T', ' ')}）\n${item.text}`, data: { found: true, id: item.id } };
+  }
+  if (action === 'unpin') {
+    const ok = await blackBox.unpin(input.id, now);
+    return { text: ok ? `不再提醒了（条目还在）：${input.id}` : `匣子里没有这条：${input.id ?? ''}`, data: { unpinned: ok } };
   }
   if (action === 'burn') {
     const ok = await blackBox.burn(input.id, now);
@@ -1372,7 +1447,7 @@ const server = createServer(async (request, response) => {
           return { stats: computePersonalityStats(core), core };
         },
         personalityAnchorUpdate: async (input) => personality.updateAnchors(input),
-        cabinInbox: async () => cabin.unlockedUserNotes(),
+        cabinInbox: async () => cabin.aiInbox({ markRead: true }),
         cabinNote: async (note) => cabin.addNote({ ...note, from: 'ai', locked: false }),
         // 公共留言板：只有配了令牌才把 board_post / board_read 工具暴露出来 / 接受调用。
         boardEnabled: boardEnabled(config),
@@ -1404,6 +1479,15 @@ const server = createServer(async (request, response) => {
         'MCP-Protocol-Version': negotiatedProtocolVersion(request, payload, result),
       });
     }
+    // 4.0 手机上报：用单独的 PHONE_ACTIVITY_TOKEN，不用总令牌（手机上不该放总令牌）。没开注意力监测就不收
+    if (request.method === 'POST' && url.pathname === '/v1/phone-activity') {
+      const want = process.env.PHONE_ACTIVITY_TOKEN ?? '';
+      const got = String(request.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
+      if (!attention.enabled || want.length < 16) return send(response, 404, { error: 'phone activity not enabled' });
+      if (!safeEqual(got, want)) return send(response, 401, { error: 'unauthorized' });
+      try { return send(response, 200, await attention.phoneActivity(await body(request))); }
+      catch (error) { return send(response, error.status ?? 400, { error: error.message }); }
+    }
     if (!authorized(request)) return send(response, 401, { error: 'unauthorized' });
 
     if (request.method === 'GET' && url.pathname.startsWith('/v1/dashboard/')) {
@@ -1421,12 +1505,12 @@ const server = createServer(async (request, response) => {
         generatedAt: new Date().toISOString(),
       });
     }
-    // 钩子用的"此刻"压缩块：只读状态，不记投递、不动 pending。星港 UserPromptSubmit 每条消息拉一次。
+    // 钩子用的"此刻"压缩块：只读状态，不记投递、不动 pending。客户端 UserPromptSubmit 每条消息拉一次。
     if (request.method === 'GET' && url.pathname === '/v1/now') {
       const state = await store.read();
-      let boxCount = 0; let boxSurfaced = 0;
-      try { boxCount = await blackBox.count(new Date()); boxSurfaced = (await blackBox.surfaced(new Date())).length; } catch { boxCount = 0; }
-      return send(response, 200, buildNowCompact(state, new Date(), { timeZone: config.settle.timeZone, boxCount, boxSurfaced, awarenessReviewWeekday: config.awareness.reviewWeekday }));
+      let boxCount = 0; let boxSurfaced = 0; let boxSurfacedIds = [];
+      try { boxCount = await blackBox.count(new Date()); const surf = await blackBox.surfaced(new Date()); boxSurfaced = surf.length; boxSurfacedIds = surf.map((x) => x.id); } catch { boxCount = 0; }
+      return send(response, 200, buildNowCompact(state, new Date(), { timeZone: config.settle.timeZone, boxCount, boxSurfaced, boxSurfacedIds, awarenessReviewWeekday: config.awareness.reviewWeekday }));
     }
     if (request.method === 'GET' && url.pathname === '/v1/context') {
       if (!config.context.enabled) return send(response, 503, { error: 'context envelope disabled' });
@@ -1456,6 +1540,8 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && (url.pathname === '/v1/conversation-event' || url.pathname === '/v1/heartbeat')) {
       const event = await body(request);
       const source = url.pathname === '/v1/heartbeat' ? 'heartbeat' : 'api';
+      if (source === 'api') noteRecentTurn(event?.recent ?? event?.note ?? '');   // 只留内存，给 Jev 陪跑当参照
+      if (source === 'api' && attention.enabled) await attention.noteHerWords(event?.recent ?? event?.herWords ?? event?.her_words ?? splitExchange(event?.exchange ?? '').her ?? '');
       const classified = source === 'heartbeat' ? null : await classifyExchange(event, 'api');
       const result = await recordConversationEvent(event, source);
       return send(response, 200, classified?.type ? { ...result, classified } : result);
@@ -1507,6 +1593,9 @@ timer.unref();
 
 const bridgeTimer = setInterval(() => publishReadyBridgeDeliveries().catch((error) => log('bridge_publish_failed', { message: error.message })), config.bridge.pollSeconds * 1000);
 bridgeTimer.unref();
+
+const attentionTimer = setInterval(() => attention.tick().catch((error) => log('attention_failed', { message: error.message })), 5 * 60_000);
+attentionTimer.unref();
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => server.close(() => process.exit(0)));

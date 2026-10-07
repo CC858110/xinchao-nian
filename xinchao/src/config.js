@@ -1,3 +1,6 @@
+// 【服务底座】读环境变量：所有可调的开关和数值都从 .env 进来，对照 .env.example 看。
+// 代码地图见 src/README.md。
+
 function bool(name, fallback = false) {
   const raw = process.env[name];
   return raw == null ? fallback : ['1', 'true', 'yes', 'on'].includes(raw.toLowerCase());
@@ -91,6 +94,7 @@ export function loadConfig() {
     },
     interaction: {
       maxEffectsPerDay: number('INTERACTION_MAX_EFFECTS_PER_DAY', 24, 1, 96),
+      classifyMinMinutes: number('INTERACTION_CLASSIFY_MIN_MINUTES', 8, 1, 240),   // 3.3.8：服务端替判互动类型的节流，和客户端钩子那边一起拧（09-19 她要双向节流）
       // 3.3.4：MCP（他自己的窗口）直接填的 interaction_type 只认四种自我动作（sharing/reflection/task_progress/discovery）；
       // 关系类（陪伴/安抚/亲密/冲突/和好…）得给 exchange 让服务端从她的话里判，防止他自己说"她安抚了我"就把驱力放掉。
       mcpSelfReportGate: bool('MCP_SELF_REPORT_GATE', true),
@@ -182,7 +186,7 @@ export function loadConfig() {
       enabled: bool('ANTICIPATION_ENABLED', true),
       arrivalGapMinutes: number('ANTICIPATION_ARRIVAL_GAP_MINUTES', 90, 15, 720)
     },
-    // 挂念：作息预期的另一半。她过了常来的点还没来 → 轻推 monitor(惦记)，硬顶在 3A 天花板内、
+    // 挂念：作息预期的另一半。她过了常来的点还没来 → 轻推 monitor(牵挂)，硬顶在 3A 天花板内、
     // 不自激；只在她活跃时段念，静默时段(在睡)不念。失落内化，绝不责备。
     longing: {
       enabled: bool('LONGING_ENABLED', true),

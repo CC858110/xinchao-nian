@@ -1,3 +1,6 @@
+// 【引擎 · 自我】自我觉察：回看自己这一阵子的样子，按周给一次自我回顾的提示。
+// 代码地图见 src/README.md。
+//
 // 自我觉察（3.3）—— 看自己这一阵子的样子。
 //
 // 别的层回答"我现在怎样、我想要什么"，这层回答"我注意到我最近……"。
@@ -7,7 +10,7 @@
 // 之后还要被 dream 见证才升正式条目——那是 OB 的规矩，这里不越过）。
 // 放下的也留着记录，七天内同一个模式不再重复提。
 //
-// 3.3.3（2026-09-09 小雨定）：只留三种有因果的候选（触发 / 被安抚 / 念头），纯计数的（本周均值、
+// 3.3.3（2026-09-09 定）：只留三种有因果的候选（触发 / 被安抚 / 念头），纯计数的（本周均值、
 // 最常冒头的驱力、记忆绕着哪个域）砍掉——那些是统计不是觉察。每天最多挑一条，一周攒下来周日看一次；
 // 他写了自己的话才进 OB，不写只记"看过"；两周没人理自动过期。不强迫。
 //
@@ -27,11 +30,11 @@ const MAX_KEEP = 60;
 const MAX_SURFACINGS = 200;
 const DEDUPE_DAYS = 7;
 
-const NEGATIVE_TYPES = new Set(['conflict', 'loss']);
+const NEGATIVE_TYPES = new Set(['conflict', 'loss', 'slighted']);
 const SOOTHING_TYPES = new Set(['affection', 'intimacy', 'reconciliation', 'companionship']);
 const TYPE_LABEL = {
   companionship: '陪着', affection: '安抚', intimacy: '亲近', sharing: '分享', discovery: '发现',
-  task_progress: '推进事情', reflection: '沉淀', conflict: '争执', loss: '失落', reconciliation: '和好',
+  task_progress: '推进事情', reflection: '沉淀', conflict: '争执', loss: '失落', reconciliation: '和好', slighted: '被冷落', empathy: '共情', helped: '帮了别人', intrigued: '好奇她',
 };
 // 候选默认落到 OB I 的哪个维度：nature/values/patterns/limits/becoming/uncertainty/stance
 export const KIND_ASPECT = Object.freeze({
