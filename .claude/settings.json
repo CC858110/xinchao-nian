@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "leto": {
+      "type": "streamable-http",
+      "url": "https://leto.sarl/mcp",
+      "headers": {
+        "Authorization": "Bearer proxy-injected"
+      }
+    }
+  }
+}
